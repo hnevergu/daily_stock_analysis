@@ -267,8 +267,30 @@ class TushareFetcher(BaseFetcher):
         """返回上海时区当前时间，方便测试覆盖跨日刷新逻辑。"""
         return datetime.now(ZoneInfo("Asia/Shanghai"))
 
+    @staticmethod
+    def _generate_heuristic_trade_dates(end_date_str: str, lookback_days: int = 30) -> List[str]:
+        """当 API 不可用时，生成启发式交易日列表（排除周末）。
+
+        Args:
+            end_date_str: 截止日期 YYYYMMDD
+            lookback_days: 向前回溯的天数
+
+        Returns:
+            倒序排列的交易日列表（最新在前）
+        """
+        from datetime import datetime, timedelta
+        end = datetime.strptime(end_date_str, '%Y%m%d')
+        dates: List[str] = []
+        for i in range(lookback_days):
+            d = end - timedelta(days=i)
+            if d.weekday() < 5:  # Monday=0 … Friday=4
+                dates.append(d.strftime('%Y%m%d'))
+        return dates  # already descending (most recent first)
+
     def _get_trade_dates(self, end_date: Optional[str] = None) -> List[str]:
-        """按自然日刷新交易日历缓存，避免服务跨日后继续复用旧日历。"""
+        """按自然日刷新交易日历缓存，避免服务跨日后继续复用旧日历。
+
+        当 trade_cal API 因限流或网络问题不可用时，自动降级为启发式日期。"""
         if self._api is None:
             return []
 
@@ -287,8 +309,10 @@ class TushareFetcher(BaseFetcher):
         )
 
         if df_cal is None or df_cal.empty or "cal_date" not in df_cal.columns:
-            logger.warning("[Tushare] trade_cal 返回为空，无法更新交易日历缓存")
-            self.date_list = []
+            logger.warning(
+                "[Tushare] trade_cal 不可用，使用启发式交易日历降级（仅排除周末）"
+            )
+            self.date_list = self._generate_heuristic_trade_dates(requested_end_date)
             self._date_list_end = requested_end_date
             return self.date_list
 

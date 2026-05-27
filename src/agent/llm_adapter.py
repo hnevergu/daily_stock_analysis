@@ -578,6 +578,7 @@ class LLMToolAdapter:
 
         last_error = None
         hit_rate_limit = False
+        hit_location_unsupported = False
         for idx, model in enumerate(models_to_try):
             remaining_timeout = timeout
             if timeout is not None and timeout > 0:
@@ -597,8 +598,25 @@ class LLMToolAdapter:
                     timeout=remaining_timeout,
                 )
             except Exception as e:
-                if isinstance(e, _resolve_litellm_exception("RateLimitError")):
-                    logger.warning("Agent LLM rate-limited on %s: %s", model, e)
+                if is_litellm_location_unsupported_error(e):
+                    logger.warning("Agent LLM location unsupported on %s: %s", model, e)
+                    last_error = e
+                    hit_location_unsupported = True
+                    continue
+
+                # Treat ServiceUnavailable as a transient, retryable event similar
+                # to RateLimitError (503 spikes). Apply a small backoff before
+                # attempting the next fallback model when the next model is
+                # provided by the same upstream provider.
+                if isinstance(e, _resolve_litellm_exception("RateLimitError")) or isinstance(
+                    e, _resolve_litellm_exception("ServiceUnavailableError")
+                ):
+                    # Log distinct messages for visibility
+                    if isinstance(e, _resolve_litellm_exception("ServiceUnavailableError")):
+                        logger.warning("Agent LLM service unavailable on %s: %s", model, e)
+                    else:
+                        logger.warning("Agent LLM rate-limited on %s: %s", model, e)
+
                     last_error = e
                     hit_rate_limit = True
 
@@ -625,7 +643,11 @@ class LLMToolAdapter:
                 last_error = e
                 continue
 
-        suffix = " (rate-limit encountered during fallback)" if hit_rate_limit else ""
+        suffix = ""
+        if hit_location_unsupported:
+            suffix = " (provider location unsupported)"
+        elif hit_rate_limit:
+            suffix = " (rate-limit encountered during fallback)"
         error_msg = f"All LLM models failed{suffix}. Last error: {last_error}"
         logger.error(error_msg)
         return LLMResponse(content=error_msg, provider="error")

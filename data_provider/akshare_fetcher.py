@@ -28,6 +28,7 @@ import multiprocessing
 import os
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
@@ -65,6 +66,12 @@ _AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
 
+try:
+    _AK_CALL_TIMEOUT = float(os.environ.get("AKSHARE_CALL_TIMEOUT", "30"))
+except (TypeError, ValueError):
+    logger.warning("AKSHARE_CALL_TIMEOUT is not a valid number, using default 30s")
+    _AK_CALL_TIMEOUT = 30.0
+
 
 # User-Agent 池，用于随机轮换
 USER_AGENTS = [
@@ -84,15 +91,59 @@ USER_AGENTS = [
 _realtime_cache: Dict[str, Any] = {
     'data': None,
     'timestamp': 0,
-    'ttl': 1200  # 20分钟缓存有效期
+    'ttl': 1200,  # 20分钟缓存有效期
+    'empty_ttl': 60,  # 失败/空结果短缓存，避免长时间污染行情
 }
 
 # ETF 实时行情缓存
 _etf_realtime_cache: Dict[str, Any] = {
     'data': None,
     'timestamp': 0,
-    'ttl': 1200  # 20分钟缓存有效期
+    'ttl': 1200,  # 20分钟缓存有效期
+    'empty_ttl': 60,
 }
+
+_stock_list_cache: Dict[str, Any] = {
+    'data': None,
+    'timestamp': 0,
+    'ttl': 86400,
+}
+
+
+def _ak_call_with_timeout(func, *args, call_timeout: Optional[float] = None, **kwargs):
+    """
+    Run an AkShare call with a bounded caller-side wait.
+
+    Some AkShare APIs expose a ``timeout`` parameter while others do not. This
+    wrapper keeps the analysis pipeline from hanging indefinitely on the latter.
+    """
+    timeout = _AK_CALL_TIMEOUT if call_timeout is None else call_timeout
+    if timeout is None or timeout <= 0:
+        return func(*args, **kwargs)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(func, *args, **kwargs)
+        return future.result(timeout=timeout)
+    except FuturesTimeoutError as exc:
+        raise TimeoutError(f"AkShare call timeout after {timeout:.1f}s") from exc
+    finally:
+        executor.shutdown(wait=False)
+
+
+def _cache_ttl(cache: Dict[str, Any]) -> float:
+    data = cache.get('data')
+    if isinstance(data, pd.DataFrame) and data.empty:
+        return float(cache.get('empty_ttl', cache.get('ttl', 0)))
+    return float(cache.get('ttl', 0))
+
+
+def _normalize_a_share_symbol(stock_code: str) -> str:
+    """Normalize supported A-share/ETF inputs to AkShare's 6-digit symbol."""
+    code = normalize_stock_code(stock_code)
+    if not (code.isdigit() and len(code) == 6):
+        raise DataFetchError(f"Akshare A股接口仅支持 6 位股票/ETF 代码: {stock_code}")
+    return code
 
 
 def _is_etf_code(stock_code: str) -> bool:
@@ -233,7 +284,7 @@ def _is_us_code(stock_code: str) -> bool:
 
 def _to_sina_tx_symbol(stock_code: str) -> str:
     """Convert 6-digit A-share code to sh/sz/bj prefixed symbol for Sina/Tencent APIs."""
-    base = (stock_code.strip().split(".")[0] if "." in stock_code else stock_code).strip()
+    base = _normalize_a_share_symbol(stock_code)
     if is_bse_code(base):
         return f"bj{base}"
     # Shanghai: 60xxxx, 5xxxx (ETF), 90xxxx (B-shares)
@@ -486,6 +537,8 @@ class AkshareFetcher(BaseFetcher):
         2. 失败后尝试新浪财经接口 (ak.stock_zh_a_daily)
         3. 最后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
         """
+        stock_code = _normalize_a_share_symbol(stock_code)
+
         # 尝试列表
         methods = [
             (self._fetch_stock_data_em, "东方财富"),
@@ -517,6 +570,9 @@ class AkshareFetcher(BaseFetcher):
         数据来源：ak.stock_zh_a_hist()
         """
         import akshare as ak
+        stock_code = _normalize_a_share_symbol(stock_code)
+        start = start_date.replace('-', '')
+        end = end_date.replace('-', '')
 
         # 防封禁策略 1: 随机 User-Agent
         self._set_random_user_agent()
@@ -524,18 +580,26 @@ class AkshareFetcher(BaseFetcher):
         # 防封禁策略 2: 强制休眠
         self._enforce_rate_limit()
 
-        logger.info(f"[API调用] ak.stock_zh_a_hist(symbol={stock_code}, ...)")
+        logger.info(
+            "[API调用] ak.stock_zh_a_hist(symbol=%s, period=daily, start_date=%s, end_date=%s, adjust=qfq, timeout=%.1f)",
+            stock_code,
+            start,
+            end,
+            _AK_CALL_TIMEOUT,
+        )
 
         try:
             import time as _time
             api_start = _time.time()
 
-            df = ak.stock_zh_a_hist(
+            df = _ak_call_with_timeout(
+                ak.stock_zh_a_hist,
                 symbol=stock_code,
                 period="daily",
-                start_date=start_date.replace('-', ''),
-                end_date=end_date.replace('-', ''),
-                adjust="qfq"
+                start_date=start,
+                end_date=end,
+                adjust="qfq",
+                timeout=_AK_CALL_TIMEOUT,
             )
 
             api_elapsed = _time.time() - api_start
@@ -561,6 +625,7 @@ class AkshareFetcher(BaseFetcher):
         import akshare as ak
 
         # 转换代码格式：sh600000, sz000001, bj920748
+        stock_code = _normalize_a_share_symbol(stock_code)
         symbol = _to_sina_tx_symbol(stock_code)
 
         self._enforce_rate_limit()
@@ -610,6 +675,7 @@ class AkshareFetcher(BaseFetcher):
         import akshare as ak
 
         # 转换代码格式：sh600000, sz000001, bj920748
+        stock_code = _normalize_a_share_symbol(stock_code)
         symbol = _to_sina_tx_symbol(stock_code)
 
         self._enforce_rate_limit()
@@ -678,7 +744,8 @@ class AkshareFetcher(BaseFetcher):
             api_start = _time.time()
             
             # 调用 akshare 获取 ETF 日线数据
-            df = ak.fund_etf_hist_em(
+            df = _ak_call_with_timeout(
+                ak.fund_etf_hist_em,
                 symbol=stock_code,
                 period="daily",
                 start_date=start_date.replace('-', ''),
@@ -879,17 +946,27 @@ class AkshareFetcher(BaseFetcher):
         date, open, high, low, close, volume, amount, pct_chg
         """
         df = df.copy()
+        stock_code = normalize_stock_code(stock_code)
         
         # 列名映射（Akshare 中文列名 -> 标准英文列名）
         column_mapping = {
             '日期': 'date',
+            'date': 'date',
             '开盘': 'open',
+            'open': 'open',
             '收盘': 'close',
+            'close': 'close',
             '最高': 'high',
+            'high': 'high',
             '最低': 'low',
+            'low': 'low',
             '成交量': 'volume',
+            'volume': 'volume',
             '成交额': 'amount',
+            'amount': 'amount',
             '涨跌幅': 'pct_chg',
+            'pct_chg': 'pct_chg',
+            'change_pct': 'pct_chg',
         }
         
         # 重命名列
@@ -897,6 +974,21 @@ class AkshareFetcher(BaseFetcher):
         
         # 添加股票代码列
         df['code'] = stock_code
+
+        if 'close' in df.columns and 'open' not in df.columns:
+            df['open'] = df['close']
+            df['high'] = df['close']
+            df['low'] = df['close']
+        if 'pct_chg' not in df.columns and 'close' in df.columns:
+            close = pd.to_numeric(df['close'], errors='coerce')
+            df['pct_chg'] = close.pct_change().fillna(0) * 100
+        if 'amount' not in df.columns:
+            df['amount'] = 0
+
+        required_cols = {'date', 'open', 'high', 'low', 'close', 'volume'}
+        missing_cols = sorted(required_cols - set(df.columns))
+        if missing_cols:
+            raise DataFetchError(f"Akshare 返回数据缺少必要列: {', '.join(missing_cols)}")
         
         # 只保留需要的列
         keep_cols = ['code'] + STANDARD_COLUMNS
@@ -960,15 +1052,17 @@ class AkshareFetcher(BaseFetcher):
         import akshare as ak
         circuit_breaker = get_realtime_circuit_breaker()
         source_key = "akshare_em"
+        stock_code = _normalize_a_share_symbol(stock_code)
         
         try:
             # 检查缓存
             current_time = time.time()
+            ttl = _cache_ttl(_realtime_cache)
             if (_realtime_cache['data'] is not None and 
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
+                current_time - _realtime_cache['timestamp'] < ttl):
                 df = _realtime_cache['data']
                 cache_age = int(current_time - _realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] A股实时行情(东财) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
+                logger.debug(f"[缓存命中] A股实时行情(东财) - 缓存年龄 {cache_age}s/{int(ttl)}s")
             else:
                 # 触发全量刷新
                 logger.info(f"[缓存未命中] 触发全量刷新 A股实时行情(东财)")
@@ -984,7 +1078,7 @@ class AkshareFetcher(BaseFetcher):
                         import time as _time
                         api_start = _time.time()
 
-                        df = ak.stock_zh_a_spot_em()
+                        df = _ak_call_with_timeout(ak.stock_zh_a_spot_em)
 
                         api_elapsed = _time.time() - api_start
                         logger.info(f"[API返回] ak.stock_zh_a_spot_em 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
@@ -1001,8 +1095,8 @@ class AkshareFetcher(BaseFetcher):
                     circuit_breaker.record_failure(source_key, str(last_error))
                     df = pd.DataFrame()
                 _realtime_cache['data'] = df
-                _realtime_cache['timestamp'] = current_time
-                logger.info(f"[缓存更新] A股实时行情(东财) 缓存已刷新，TTL={_realtime_cache['ttl']}s")
+                _realtime_cache['timestamp'] = time.time()
+                logger.info(f"[缓存更新] A股实时行情(东财) 缓存已刷新，TTL={int(_cache_ttl(_realtime_cache))}s")
 
             if df is None or df.empty:
                 logger.info(f"[实时行情] A股实时行情数据为空，跳过 {stock_code}")
@@ -1370,14 +1464,16 @@ class AkshareFetcher(BaseFetcher):
         import akshare as ak
         circuit_breaker = get_realtime_circuit_breaker()
         source_key = "akshare_etf"
+        stock_code = _normalize_a_share_symbol(stock_code)
         
         try:
             # 检查缓存
             current_time = time.time()
+            ttl = _cache_ttl(_etf_realtime_cache)
             if (_etf_realtime_cache['data'] is not None and 
-                current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']):
+                current_time - _etf_realtime_cache['timestamp'] < ttl):
                 df = _etf_realtime_cache['data']
-                logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据")
+                logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据, TTL={int(ttl)}s")
             else:
                 last_error: Optional[Exception] = None
                 df = None
@@ -1391,7 +1487,7 @@ class AkshareFetcher(BaseFetcher):
                         import time as _time
                         api_start = _time.time()
 
-                        df = ak.fund_etf_spot_em()
+                        df = _ak_call_with_timeout(ak.fund_etf_spot_em)
 
                         api_elapsed = _time.time() - api_start
                         logger.info(f"[API返回] ak.fund_etf_spot_em 成功: 返回 {len(df)} 只ETF, 耗时 {api_elapsed:.2f}s")
@@ -1407,7 +1503,7 @@ class AkshareFetcher(BaseFetcher):
                     circuit_breaker.record_failure(source_key, str(last_error))
                     df = pd.DataFrame()
                 _etf_realtime_cache['data'] = df
-                _etf_realtime_cache['timestamp'] = current_time
+                _etf_realtime_cache['timestamp'] = time.time()
 
             if df is None or df.empty:
                 logger.info(f"[实时行情] ETF实时行情数据为空，跳过 {stock_code}")
@@ -1571,6 +1667,74 @@ class AkshareFetcher(BaseFetcher):
             logger.info(f"[API错误] ak.stock_hk_spot 备用接口也失败: {e}")
             circuit_breaker.record_failure(sina_key, str(e))
             return None
+
+    def get_stock_list(self) -> Optional[pd.DataFrame]:
+        """
+        获取 A 股股票代码名称列表。
+
+        数据来源：ak.stock_info_a_code_name()，用于名称解析和批量预取。
+        """
+        import akshare as ak
+
+        current_time = time.time()
+        if (
+            _stock_list_cache['data'] is not None
+            and current_time - _stock_list_cache['timestamp'] < _stock_list_cache['ttl']
+        ):
+            return _stock_list_cache['data'].copy()
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.stock_info_a_code_name() 获取A股代码名称列表...")
+
+            api_start = time.time()
+            df = _ak_call_with_timeout(ak.stock_info_a_code_name)
+            api_elapsed = time.time() - api_start
+            if df is None or df.empty:
+                logger.warning("[API返回] ak.stock_info_a_code_name 返回空数据, 耗时 %.2fs", api_elapsed)
+                return None
+
+            code_col = self._find_first_column(df, ("code", "代码", "股票代码"))
+            name_col = self._find_first_column(df, ("name", "名称", "股票简称", "股票名称"))
+            if not code_col or not name_col:
+                logger.warning("[API返回] ak.stock_info_a_code_name 缺少代码/名称列: %s", list(df.columns))
+                return None
+
+            result = df[[code_col, name_col]].copy()
+            result.columns = ["code", "name"]
+            result["code"] = result["code"].map(lambda value: normalize_stock_code(str(value).strip()))
+            result["name"] = result["name"].map(lambda value: str(value).strip())
+            result = result[
+                result["code"].map(lambda value: value.isdigit() and len(value) == 6)
+                & result["name"].map(bool)
+            ].drop_duplicates("code").reset_index(drop=True)
+
+            _stock_list_cache['data'] = result.copy()
+            _stock_list_cache['timestamp'] = time.time()
+            logger.info("[API返回] ak.stock_info_a_code_name 成功: rows=%d, 耗时 %.2fs", len(result), api_elapsed)
+            return result
+        except Exception as e:
+            logger.warning("[Akshare] 获取A股代码名称列表失败: %s", e)
+            return None
+
+    def get_stock_name(self, stock_code: str) -> Optional[str]:
+        """通过 AkShare A 股代码名称表获取股票名称。"""
+        if _is_us_code(stock_code) or _is_hk_code(stock_code):
+            return None
+        try:
+            code = _normalize_a_share_symbol(stock_code)
+        except DataFetchError:
+            return None
+
+        stock_list = self.get_stock_list()
+        if stock_list is None or stock_list.empty:
+            return None
+        row = stock_list[stock_list["code"] == code]
+        if row.empty:
+            return None
+        name = str(row.iloc[0].get("name", "")).strip()
+        return name or None
     
     def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
         """
@@ -1628,17 +1792,21 @@ class AkshareFetcher(BaseFetcher):
             latest = df.iloc[-1]
             
             # 使用 realtime_types.py 中的统一转换函数
+            # 东财接口返回百分比数值（如 55.23 表示 55.23%），需转为 0-1 比率
+            raw_profit_ratio = safe_float(latest.get('获利比例'))
+            raw_concentration_90 = safe_float(latest.get('90集中度'))
+            raw_concentration_70 = safe_float(latest.get('70集中度'))
             chip = ChipDistribution(
                 code=stock_code,
                 date=str(latest.get('日期', '')),
-                profit_ratio=safe_float(latest.get('获利比例')),
+                profit_ratio=raw_profit_ratio / 100.0 if raw_profit_ratio is not None else None,
                 avg_cost=safe_float(latest.get('平均成本')),
                 cost_90_low=safe_float(latest.get('90成本-低')),
                 cost_90_high=safe_float(latest.get('90成本-高')),
-                concentration_90=safe_float(latest.get('90集中度')),
+                concentration_90=raw_concentration_90 / 100.0 if raw_concentration_90 is not None else None,
                 cost_70_low=safe_float(latest.get('70成本-低')),
                 cost_70_high=safe_float(latest.get('70成本-高')),
-                concentration_70=safe_float(latest.get('70集中度')),
+                concentration_70=raw_concentration_70 / 100.0 if raw_concentration_70 is not None else None,
             )
             
             logger.info(f"[筹码分布] {stock_code} 日期={chip.date}: 获利比例={chip.profit_ratio:.1%}, "
@@ -1832,11 +2000,22 @@ class AkshareFetcher(BaseFetcher):
         
         # 1. 提取基础比对数据：最新价、昨收
         # 兼容不同接口返回的列名 sina/em efinance tushare xtdata
-        code_col = next((c for c in ['代码', '股票代码', 'ts_code','stock_code'] if c in df.columns), None)
-        name_col = next((c for c in ['名称', '股票名称','name','name'] if c in df.columns), None)
-        close_col = next((c for c in ['最新价', '最新价', 'close','lastPrice'] if c in df.columns), None)
-        pre_close_col = next((c for c in ['昨收', '昨日收盘', 'pre_close','lastClose'] if c in df.columns), None)
-        amount_col = next((c for c in ['成交额', '成交额', 'amount','amount'] if c in df.columns), None) 
+        code_col = next((c for c in ['代码', '股票代码', 'ts_code', 'stock_code'] if c in df.columns), None)
+        name_col = next((c for c in ['名称', '股票名称', 'name'] if c in df.columns), None)
+        close_col = next((c for c in ['最新价', 'close', 'lastPrice'] if c in df.columns), None)
+        pre_close_col = next((c for c in ['昨收', '昨日收盘', 'pre_close', 'lastClose'] if c in df.columns), None)
+        amount_col = next((c for c in ['成交额', 'amount'] if c in df.columns), None)
+        required = {
+            'code': code_col,
+            'name': name_col,
+            'latest': close_col,
+            'pre_close': pre_close_col,
+            'amount': amount_col,
+        }
+        missing = [label for label, col in required.items() if col is None]
+        if missing:
+            logger.warning("[Akshare] 市场统计缺少必要列: %s, columns=%s", missing, list(df.columns))
+            return None
         
         limit_up_count = 0
         limit_down_count = 0
@@ -1853,8 +2032,10 @@ class AkshareFetcher(BaseFetcher):
                 continue
             
             # em、efinance 为str 需要转换为float
-            current_price = float(current_price)
-            pre_close = float(pre_close)
+            current_price = safe_float(current_price)
+            pre_close = safe_float(pre_close)
+            if current_price is None or pre_close is None or current_price <= 0 or pre_close <= 0:
+                continue
             
             # 获取去除前缀的纯数字代码
             pure_code = normalize_stock_code(str(code)) 

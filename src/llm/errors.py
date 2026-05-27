@@ -22,6 +22,12 @@ _UNSUPPORTED_PARAM_MARKERS = (
     "does not support",
 )
 
+_LOCATION_UNSUPPORTED_MARKERS = (
+    "user location is not supported",
+    "location is not supported for the api use",
+    "unsupported user location",
+)
+
 _TEMPERATURE_VALUE_PATTERN = r"-?\d+(?:\.\d+)?"
 _ALLOWED_TEMPERATURE_PATTERNS = (
     re.compile(
@@ -110,6 +116,14 @@ def classify_litellm_generation_param_error(
                 reason=f"{param}_unsupported",
             )
     return None
+
+
+def is_litellm_location_unsupported_error(error: BaseException) -> bool:
+    """Return True when a provider rejects API use from the caller's location."""
+    text = _normalized_error_text(error)
+    if not text:
+        return False
+    return any(marker in text for marker in _LOCATION_UNSUPPORTED_MARKERS)
 
 
 def call_litellm_with_param_recovery(

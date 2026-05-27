@@ -4,6 +4,7 @@
 from src.llm.errors import (
     call_litellm_with_param_recovery,
     classify_litellm_generation_param_error,
+    is_litellm_location_unsupported_error,
 )
 from src.llm.generation_params import (
     apply_litellm_generation_params,
@@ -22,6 +23,17 @@ def test_temperature_default_only_error_sets_temperature_to_one() -> None:
     assert recovery is not None
     assert recovery.set_params == {"temperature": 1.0}
     assert recovery.omit_params == ()
+
+
+def test_location_unsupported_error_is_classified_separately() -> None:
+    error = RuntimeError(
+        'GeminiException BadRequestError - {"error": {"code": 400, '
+        '"message": "User location is not supported for the API use.", '
+        '"status": "FAILED_PRECONDITION"}}'
+    )
+
+    assert is_litellm_location_unsupported_error(error) is True
+    assert classify_litellm_generation_param_error(error) is None
 
 
 def test_temperature_default_only_error_uses_named_default_value() -> None:

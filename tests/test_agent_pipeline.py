@@ -2726,6 +2726,44 @@ class TestAgentConstructionChain(unittest.TestCase):
         mock_sleep.assert_not_called()
 
     @patch("src.agent.llm_adapter.Router")
+    def test_llm_adapter_reports_location_unsupported_without_rate_limit_suffix(self, _mock_router):
+        """Gemini regional API rejection should not be presented as fallback rate limiting."""
+        mock_cfg = MagicMock()
+        mock_cfg.agent_litellm_model = "gemini/gemini-2.0-flash"
+        mock_cfg.litellm_model = None
+        mock_cfg.litellm_fallback_models = ["gemini/gemini-2.0-flash-lite"]
+        mock_cfg.llm_model_list = []
+        mock_cfg.llm_temperature = 0.7
+        mock_cfg.gemini_api_keys = []
+        mock_cfg.anthropic_api_keys = []
+        mock_cfg.openai_api_keys = []
+        mock_cfg.deepseek_api_keys = []
+        mock_cfg.openai_base_url = None
+
+        from src.agent.llm_adapter import LLMToolAdapter
+        adapter = LLMToolAdapter(config=mock_cfg)
+
+        class FakeRateLimitError(Exception):
+            pass
+
+        unsupported_location = (
+            'GeminiException BadRequestError - {"error": {"code": 400, '
+            '"message": "User location is not supported for the API use.", '
+            '"status": "FAILED_PRECONDITION"}}'
+        )
+        adapter._call_litellm_model = MagicMock(side_effect=FakeRateLimitError(unsupported_location))
+
+        with patch("src.agent.llm_adapter.litellm.RateLimitError", FakeRateLimitError), \
+             patch("src.agent.llm_adapter.time.sleep") as mock_sleep:
+            result = adapter.call_completion(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+        self.assertEqual(result.provider, "error")
+        self.assertIn("All LLM models failed (provider location unsupported).", result.content)
+        self.assertIn("User location is not supported", result.content)
+        self.assertNotIn("rate-limit encountered during fallback", result.content)
+        mock_sleep.assert_not_called()
+
+    @patch("src.agent.llm_adapter.Router")
     def test_llm_adapter_reports_missing_configuration_without_generic_none_error(self, _mock_router):
         """Missing Agent model config should return a stable, actionable error message."""
         mock_cfg = SimpleNamespace(
