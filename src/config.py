@@ -1915,6 +1915,8 @@ class Config:
             realtime_source_priority=cls._resolve_realtime_source_priority(),
             realtime_cache_ttl=parse_env_int(os.getenv('REALTIME_CACHE_TTL'), 600, field_name='REALTIME_CACHE_TTL', minimum=0),
             circuit_breaker_cooldown=parse_env_int(os.getenv('CIRCUIT_BREAKER_COOLDOWN'), 300, field_name='CIRCUIT_BREAKER_COOLDOWN', minimum=0),
+            akshare_sleep_min=parse_env_float(os.getenv('AKSHARE_SLEEP_MIN'), 2.0, field_name='AKSHARE_SLEEP_MIN', minimum=0.0),
+            akshare_sleep_max=parse_env_float(os.getenv('AKSHARE_SLEEP_MAX'), 5.0, field_name='AKSHARE_SLEEP_MAX', minimum=0.0),
             enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',
             fundamental_stage_timeout_seconds=parse_env_float(
                 os.getenv('FUNDAMENTAL_STAGE_TIMEOUT_SECONDS'),

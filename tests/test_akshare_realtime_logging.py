@@ -10,6 +10,8 @@ from data_provider.akshare_fetcher import (
     AkshareFetcher,
     SINA_REALTIME_ENDPOINT,
     TENCENT_REALTIME_ENDPOINT,
+    _realtime_cache,
+    _stock_list_cache,
 )
 
 
@@ -341,3 +343,120 @@ def test_limit_up_pool_zero_pads_first_seal_times_before_sorting(monkeypatch, ak
     assert [row["code"] for row in result] == ["000001", "000003", "000002"]
     assert result[0]["first_limit_time"] == "092500"
     assert result[0]["last_limit_time"] == "093000"
+
+
+def test_a_share_history_em_normalizes_symbol_and_passes_timeout(monkeypatch, akshare_fetcher):
+    calls = {}
+
+    def _stock_zh_a_hist(**kwargs):
+        calls.update(kwargs)
+        return pd.DataFrame(
+            [
+                {
+                    "日期": "2026-05-25",
+                    "开盘": 10,
+                    "收盘": 11,
+                    "最高": 12,
+                    "最低": 9,
+                    "成交量": 1000,
+                    "成交额": 11000,
+                    "涨跌幅": 1.2,
+                }
+            ]
+        )
+
+    fake_akshare = SimpleNamespace(stock_zh_a_hist=_stock_zh_a_hist)
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+
+    df = akshare_fetcher._fetch_stock_data_em("SH.600519", "2026-05-01", "2026-05-25")
+
+    assert not df.empty
+    assert calls["symbol"] == "600519"
+    assert calls["start_date"] == "20260501"
+    assert calls["end_date"] == "20260525"
+    assert calls["adjust"] == "qfq"
+    assert calls["timeout"] > 0
+
+
+def test_normalize_data_accepts_english_columns_and_fills_optional_fields(akshare_fetcher):
+    df = pd.DataFrame(
+        [
+            {"date": "2026-05-24", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 100},
+            {"date": "2026-05-25", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 120},
+        ]
+    )
+
+    out = akshare_fetcher._normalize_data(df, "SH.600519")
+
+    assert list(out.columns) == ["code", "date", "open", "high", "low", "close", "volume", "amount", "pct_chg"]
+    assert out["code"].tolist() == ["600519", "600519"]
+    assert out["amount"].tolist() == [0, 0]
+    assert out["pct_chg"].iloc[1] == pytest.approx(10.0)
+
+
+def test_realtime_em_empty_cache_uses_short_ttl(monkeypatch, akshare_fetcher):
+    breaker = _DummyCircuitBreaker()
+    monkeypatch.setattr("data_provider.akshare_fetcher.get_realtime_circuit_breaker", lambda: breaker)
+    monkeypatch.setattr("data_provider.akshare_fetcher.time.sleep", lambda _seconds: None)
+    _realtime_cache.update({"data": None, "timestamp": 0, "ttl": 1200, "empty_ttl": 60})
+
+    calls = {"count": 0, "fail": True}
+
+    def _stock_zh_a_spot_em():
+        calls["count"] += 1
+        if calls["fail"]:
+            raise TimeoutError("temporary timeout")
+        return pd.DataFrame(
+            [
+                {
+                    "代码": "600519",
+                    "名称": "贵州茅台",
+                    "最新价": 1500,
+                    "涨跌幅": 1.0,
+                    "成交量": 1000,
+                    "成交额": 1500000,
+                }
+            ]
+        )
+
+    fake_akshare = SimpleNamespace(stock_zh_a_spot_em=_stock_zh_a_spot_em)
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+
+    assert akshare_fetcher._get_stock_realtime_quote_em("600519") is None
+    assert calls["count"] == 2
+
+    assert akshare_fetcher._get_stock_realtime_quote_em("600519") is None
+    assert calls["count"] == 2
+
+    _realtime_cache["timestamp"] -= 61
+    calls["fail"] = False
+    quote = akshare_fetcher._get_stock_realtime_quote_em("600519")
+
+    assert quote is not None
+    assert quote.name == "贵州茅台"
+    assert calls["count"] == 3
+
+
+def test_stock_list_and_name_use_akshare_code_name(monkeypatch, akshare_fetcher):
+    _stock_list_cache.update({"data": None, "timestamp": 0, "ttl": 86400})
+
+    def _stock_info_a_code_name():
+        return pd.DataFrame(
+            [
+                {"code": "600519", "name": "贵州茅台"},
+                {"code": "000001", "name": "平安银行"},
+                {"code": "600519", "name": "贵州茅台"},
+            ]
+        )
+
+    fake_akshare = SimpleNamespace(stock_info_a_code_name=_stock_info_a_code_name)
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+
+    stock_list = akshare_fetcher.get_stock_list()
+
+    assert stock_list is not None
+    assert stock_list.to_dict("records") == [
+        {"code": "600519", "name": "贵州茅台"},
+        {"code": "000001", "name": "平安银行"},
+    ]
+    assert akshare_fetcher.get_stock_name("SH.600519") == "贵州茅台"

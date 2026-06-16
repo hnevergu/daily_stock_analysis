@@ -438,7 +438,7 @@ class AkshareFetcher(BaseFetcher):
     name = "AkshareFetcher"
     priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
     
-    def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
+    def __init__(self, sleep_min: Optional[float] = None, sleep_max: Optional[float] = None):
         """
         初始化 AkshareFetcher
         
@@ -446,12 +446,16 @@ class AkshareFetcher(BaseFetcher):
             sleep_min: 最小休眠时间（秒）
             sleep_max: 最大休眠时间（秒）
         """
-        self.sleep_min = sleep_min
-        self.sleep_max = sleep_max
+        config = get_config()
+        self.sleep_min = float(sleep_min if sleep_min is not None else getattr(config, "akshare_sleep_min", 2.0))
+        self.sleep_max = float(sleep_max if sleep_max is not None else getattr(config, "akshare_sleep_max", 5.0))
+        if self.sleep_max < self.sleep_min:
+            logger.warning("AKSHARE_SLEEP_MAX < AKSHARE_SLEEP_MIN, using min value for both")
+            self.sleep_max = self.sleep_min
         self._last_request_time: Optional[float] = None
         self._history_call_timeout = _AKSHARE_HISTORY_CALL_TIMEOUT
         # 东财补丁开启才执行打补丁操作
-        if get_config().enable_eastmoney_patch:
+        if getattr(config, "enable_eastmoney_patch", False):
             eastmoney_patch()
     
     def _set_random_user_agent(self) -> None:

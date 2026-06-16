@@ -391,6 +391,8 @@ daily_stock_analysis/
 | `ENABLE_REALTIME_TECHNICAL_INDICATORS` | 盘中实时技术面：启用时用实时价计算 MA5/MA10/MA20 与多头排列（Issue #234）；关闭则用昨日收盘 | `true` | 可选 |
 | `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析（该接口不稳定，云端部署建议关闭）。GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |
 | `ENABLE_EASTMONEY_PATCH` | 东财接口补丁：东财接口频繁失败（如 RemoteDisconnected、连接被关闭）时建议设为 `true`，注入 NID 令牌与随机 User-Agent 以降低被限流概率 | `false` | 可选 |
+| `AKSHARE_CALL_TIMEOUT` | AkShare 单次 API 调用超时（秒），用于 A 股历史 K 线、实时全量行情、ETF 等接口的调用保护 | `30` | 可选 |
+| `AKSHARE_SLEEP_MIN` / `AKSHARE_SLEEP_MAX` | AkShare 请求间隔与随机抖动范围（秒），降低连续请求触发限流的概率 | `2.0` / `5.0` | 可选 |
 | `REALTIME_SOURCE_PRIORITY` | 实时行情数据源优先级（逗号分隔），如 `tencent,akshare_sina,efinance,akshare_em` | 见 .env.example | 可选 |
 | `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时仅返回 `not_supported` 块，不改变原分析链路 | `true` | 可选 |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总时延预算（秒） | `8.0` | 可选 |
@@ -1307,6 +1309,8 @@ python main.py --debug
 - 调试日志：`logs/stock_analysis_debug_YYYYMMDD.log`
 
 调试日志默认保留项目自身 DEBUG 信息，但会将 LiteLLM 内部日志压低到 `WARNING`，避免流式生成时按 token 写入大量第三方调试日志；如需排查 LiteLLM 内部细节，可在 `.env` 中临时设置 `LITELLM_LOG_LEVEL=DEBUG`。
+
+若你的运行环境与 GitHub 原始文件下载链路不稳定，或希望避免 LiteLLM 启动时的远程模型成本映射请求，可在 `.env` 中设置 `LITELLM_LOCAL_MODEL_COST_MAP=true`。这会强制使用 LiteLLM 内置备份模型成本/上下文映射，避免类似 `Failed to fetch remote model cost map` 的警告。
 
 ### SQLite 写入稳态配置
 
