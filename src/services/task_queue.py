@@ -912,15 +912,15 @@ class AnalysisTaskQueue:
         """
         with self._subscribers_lock:
             self._subscribers.append(queue)
-            # 捕获当前事件循环（应在主线程的 async 上下文中调用）
+            # 仅在当前 async 上下文中使用已有事件循环，避免 Python 3.12 在没有运行循环时
+            # 创建一个默认循环并在程序退出时产生 ResourceWarning。
             try:
                 self._main_loop = asyncio.get_running_loop()
             except RuntimeError:
-                # 如果不在 async 上下文中，尝试获取事件循环
-                try:
-                    self._main_loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    pass
+                logger.warning(
+                    "[TaskQueue] 无法订阅任务事件：当前上下文没有活动 asyncio 事件循环。"
+                )
+                self._main_loop = None
             logger.debug(f"[TaskQueue] 新订阅者加入，当前订阅者数: {len(self._subscribers)}")
     
     def unsubscribe(self, queue: 'AsyncQueue') -> None:
