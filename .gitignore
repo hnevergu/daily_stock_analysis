@@ -43,6 +43,7 @@ venv/
 ENV/
 env/
 .venv/
+myenv/
 
 # IDE
 .idea/
@@ -87,3 +88,6 @@ static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
 docs/specs/
+
+# Local model prices / context window data
+model_prices_and_context_window.json
